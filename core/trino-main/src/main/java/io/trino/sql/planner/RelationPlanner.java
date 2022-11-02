@@ -251,26 +251,30 @@ class RelationPlanner
             }
         }
 
-        plan = addRowFilters(node, plan);
+        plan = addRowConstraints(node, plan);
         plan = addColumnMasks(node, plan);
 
         return plan;
     }
 
-    private RelationPlan addRowFilters(Table node, RelationPlan plan)
+    private RelationPlan addRowConstraints(Table node, RelationPlan plan)
     {
-        return addRowFilters(node, plan, Function.identity());
+        return addRowConstraints(node, plan, Function.identity());
     }
 
-    public RelationPlan addRowFilters(Table node, RelationPlan plan, Function<Expression, Expression> predicateTransformation)
+    public RelationPlan addRowConstraints(Table node, RelationPlan plan, Function<Expression, Expression> predicateTransformation)
     {
-        return addRowFilters(node, plan, predicateTransformation, analysis::getAccessControlScope);
+        return addRowConstraints(node, plan, predicateTransformation, analysis::getAccessControlScope);
     }
 
-    public RelationPlan addRowFilters(Table node, RelationPlan plan, Function<Expression, Expression> predicateTransformation, Function<Table, Scope> accessControlScope)
+    public RelationPlan addRowConstraints(Table node, RelationPlan plan, Function<Expression, Expression> predicateTransformation, Function<Table, Scope> accessControlScope)
     {
         List<Expression> filters = analysis.getRowFilters(node);
+        return addRowConstraints(filters, node, plan, predicateTransformation, accessControlScope);
+    }
 
+    public RelationPlan addRowConstraints(List<Expression> filters, Table node, RelationPlan plan, Function<Expression, Expression> predicateTransformation, Function<Table, Scope> accessControlScope)
+    {
         if (filters.isEmpty()) {
             return plan;
         }

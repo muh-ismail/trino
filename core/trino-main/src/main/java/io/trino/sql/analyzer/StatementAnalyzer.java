@@ -57,6 +57,7 @@ import io.trino.security.AccessControl;
 import io.trino.security.AllowAllAccessControl;
 import io.trino.security.SecurityContext;
 import io.trino.security.ViewAccessControl;
+import io.trino.spi.ErrorCodeSupplier;
 import io.trino.spi.TrinoException;
 import io.trino.spi.TrinoWarning;
 import io.trino.spi.connector.CatalogSchemaName;
@@ -138,6 +139,7 @@ import io.trino.sql.tree.CreateTableAsSelect;
 import io.trino.sql.tree.CreateView;
 import io.trino.sql.tree.Cube;
 import io.trino.sql.tree.Deallocate;
+import io.trino.sql.tree.DefaultTraversalVisitor;
 import io.trino.sql.tree.Delete;
 import io.trino.sql.tree.Deny;
 import io.trino.sql.tree.DereferenceExpression;
@@ -295,6 +297,7 @@ import static io.trino.spi.StandardErrorCode.EXPRESSION_NOT_IN_DISTINCT;
 import static io.trino.spi.StandardErrorCode.FUNCTION_NOT_FOUND;
 import static io.trino.spi.StandardErrorCode.FUNCTION_NOT_WINDOW;
 import static io.trino.spi.StandardErrorCode.INVALID_ARGUMENTS;
+import static io.trino.spi.StandardErrorCode.INVALID_CHECK_CONSTRAINT;
 import static io.trino.spi.StandardErrorCode.INVALID_COLUMN_REFERENCE;
 import static io.trino.spi.StandardErrorCode.INVALID_COPARTITIONING;
 import static io.trino.spi.StandardErrorCode.INVALID_FUNCTION_ARGUMENT;
@@ -540,6 +543,7 @@ class StatementAnalyzer
             List<ColumnSchema> columns = tableSchema.getColumns().stream()
                     .filter(column -> !column.isHidden())
                     .collect(toImmutableList());
+            List<String> checkConstraints = tableSchema.getTableSchema().getCheckConstraints();
 
             for (ColumnSchema column : columns) {
                 if (!accessControl.getColumnMasks(session.toSecurityContext(), targetTable, column.getName(), column.getType()).isEmpty()) {
@@ -549,7 +553,7 @@ class StatementAnalyzer
 
             Map<String, ColumnHandle> columnHandles = metadata.getColumnHandles(session, targetTableHandle.get());
             List<Field> tableFields = analyzeTableOutputFields(insert.getTable(), targetTable, tableSchema, columnHandles);
-            analyzeFiltersAndMasks(insert.getTable(), targetTable, targetTableHandle, tableFields, session.getIdentity().getUser());
+            analyzeFiltersAndMasks(insert.getTable(), targetTable, targetTableHandle, new RelationType(tableFields), session.getIdentity().getUser(), checkConstraints);
 
             List<String> tableColumns = columns.stream()
                     .map(ColumnSchema::getName)
@@ -799,7 +803,7 @@ class StatementAnalyzer
 
             analysis.setUpdateType("DELETE");
             analysis.setUpdateTarget(tableName, Optional.of(table), Optional.empty());
-            analyzeFiltersAndMasks(table, tableName, Optional.of(handle), analysis.getScope(table).getRelationType(), session.getIdentity().getUser());
+            analyzeFiltersAndMasks(table, tableName, Optional.of(handle), analysis.getScope(table).getRelationType(), session.getIdentity().getUser(), tableSchema.getTableSchema().getCheckConstraints());
 
             createMergeAnalysis(table, handle, tableSchema, tableScope, tableScope, ImmutableList.of());
 
@@ -2141,7 +2145,7 @@ class StatementAnalyzer
 
             List<Field> outputFields = fields.build();
 
-            analyzeFiltersAndMasks(table, targetTableName, tableHandle, outputFields, session.getIdentity().getUser());
+            analyzeFiltersAndMasks(table, targetTableName, tableHandle, new RelationType(outputFields), session.getIdentity().getUser(), tableSchema.getTableSchema().getCheckConstraints());
 
             Scope tableScope = createAndAssignScope(table, scope, outputFields);
 
@@ -2163,10 +2167,10 @@ class StatementAnalyzer
 
         private void analyzeFiltersAndMasks(Table table, QualifiedObjectName name, Optional<TableHandle> tableHandle, List<Field> fields, String authorization)
         {
-            analyzeFiltersAndMasks(table, name, tableHandle, new RelationType(fields), authorization);
+            analyzeFiltersAndMasks(table, name, tableHandle, new RelationType(fields), authorization, ImmutableList.of());
         }
 
-        private void analyzeFiltersAndMasks(Table table, QualifiedObjectName name, Optional<TableHandle> tableHandle, RelationType relationType, String authorization)
+        private void analyzeFiltersAndMasks(Table table, QualifiedObjectName name, Optional<TableHandle> tableHandle, RelationType relationType, String authorization, List<String> checkConstraints)
         {
             Scope accessControlScope = Scope.builder()
                     .withRelationType(RelationId.anonymous(), relationType)
@@ -2185,6 +2189,10 @@ class StatementAnalyzer
 
             accessControl.getRowFilters(session.toSecurityContext(), name)
                     .forEach(filter -> analyzeRowFilter(session.getIdentity().getUser(), table, name, accessControlScope, filter));
+            for (String checkConstraint : checkConstraints) {
+                ViewExpression filter = new ViewExpression(session.getIdentity().getUser(), Optional.of(name.getCatalogName()), Optional.of(name.getSchemaName()), checkConstraint);
+                analyzeCheckConstraint(table, name, accessControlScope, filter);
+            }
 
             analysis.registerTable(table, tableHandle, name, authorization, accessControlScope);
         }
@@ -3127,6 +3135,9 @@ class StatementAnalyzer
             if (!accessControl.getRowFilters(session.toSecurityContext(), tableName).isEmpty()) {
                 throw semanticException(NOT_SUPPORTED, update, "Updating a table with a row filter is not supported");
             }
+            if (!tableSchema.getTableSchema().getCheckConstraints().isEmpty()) {
+                throw semanticException(NOT_SUPPORTED, update, "Updating a table with a check constraint is not supported");
+            }
 
             // TODO: how to deal with connectors that need to see the pre-image of rows to perform the update without
             //       flowing that data through the masking logic
@@ -3253,6 +3264,9 @@ class StatementAnalyzer
 
             if (!accessControl.getRowFilters(session.toSecurityContext(), tableName).isEmpty()) {
                 throw semanticException(NOT_SUPPORTED, merge, "Cannot merge into a table with row filters");
+            }
+            if (!tableSchema.getTableSchema().getCheckConstraints().isEmpty()) {
+                throw semanticException(NOT_SUPPORTED, merge, "Cannot merge into a table with check constraints");
             }
 
             Scope targetTableScope = analyzer.analyzeForUpdate(relation, scope, UpdateKind.MERGE);
@@ -4548,13 +4562,7 @@ class StatementAnalyzer
                 throw new TrinoException(INVALID_ROW_FILTER, extractLocation(table), format("Row filter for '%s' is recursive", name), null);
             }
 
-            Expression expression;
-            try {
-                expression = sqlParser.createExpression(filter.getExpression(), createParsingOptions(session));
-            }
-            catch (ParsingException e) {
-                throw new TrinoException(INVALID_ROW_FILTER, extractLocation(table), format("Invalid row filter for '%s': %s", name, e.getErrorMessage()), e);
-            }
+            Expression expression = parseRowConstraintExpression(table, name, filter, INVALID_ROW_FILTER, "Invalid row filter");
 
             analysis.registerTableForRowFiltering(name, currentIdentity);
 
@@ -4562,8 +4570,51 @@ class StatementAnalyzer
 
             ExpressionAnalysis expressionAnalysis;
             try {
-                expressionAnalysis = ExpressionAnalyzer.analyzeExpression(
-                        createViewSession(filter.getCatalog(), filter.getSchema(), Identity.ofUser(filter.getIdentity()), session.getPath()), // TODO: path should be included in row filter
+                expressionAnalysis = getExpressionAnalysis(table, name, scope, filter, expression, "Invalid row filter");
+            }
+            finally {
+                analysis.unregisterTableForRowFiltering(name, currentIdentity);
+            }
+
+            analysis.recordSubqueries(expression, expressionAnalysis);
+
+            addCoercionForRowConstraint(table, name, expression, expressionAnalysis, "row filter");
+
+            analysis.addRowFilter(table, expression);
+        }
+
+        private void analyzeCheckConstraint(Table table, QualifiedObjectName name, Scope scope, ViewExpression filter)
+        {
+            Expression expression = parseRowConstraintExpression(table, name, filter, INVALID_CHECK_CONSTRAINT, "Invalid check constraint");
+
+            verifyNoAggregateWindowOrGroupingFunctions(session, metadata, expression, format("Check constraint for '%s'", name));
+            verifyNoSubqueryForCheckConstraint(expression);
+
+            ExpressionAnalysis expressionAnalysis = getExpressionAnalysis(table, name, scope, filter, expression, "Invalid check constraint");
+
+            analysis.recordSubqueries(expression, expressionAnalysis);
+
+            addCoercionForRowConstraint(table, name, expression, expressionAnalysis, "check constraint");
+
+            verifyNoSubqueryForCheckConstraint(expression);
+            analysis.addCheckConstraints(table, expression);
+        }
+
+        private Expression parseRowConstraintExpression(Table table, QualifiedObjectName name, ViewExpression filter, ErrorCodeSupplier errorCodeSupplier, String message)
+        {
+            try {
+                return sqlParser.createExpression(filter.getExpression(), createParsingOptions(session));
+            }
+            catch (ParsingException e) {
+                throw new TrinoException(errorCodeSupplier, extractLocation(table), format("%s for '%s': %s", message, name, e.getErrorMessage()), e);
+            }
+        }
+
+        private ExpressionAnalysis getExpressionAnalysis(Table table, QualifiedObjectName name, Scope scope, ViewExpression filter, Expression expression, String message)
+        {
+            try {
+                return ExpressionAnalyzer.analyzeExpression(
+                        createViewSession(filter.getCatalog(), filter.getSchema(), Identity.forUser(filter.getIdentity()).build(), session.getPath()), // TODO: path should be included in row filter
                         plannerContext,
                         statementAnalyzerFactory,
                         accessControl,
@@ -4574,26 +4625,34 @@ class StatementAnalyzer
                         correlationSupport);
             }
             catch (TrinoException e) {
-                throw new TrinoException(e::getErrorCode, extractLocation(table), format("Invalid row filter for '%s': %s", name, e.getRawMessage()), e);
+                throw new TrinoException(e::getErrorCode, extractLocation(table), format("%s for '%s': %s", message, name, e.getRawMessage()), e);
             }
-            finally {
-                analysis.unregisterTableForRowFiltering(name, currentIdentity);
-            }
+        }
 
-            analysis.recordSubqueries(expression, expressionAnalysis);
-
+        private void addCoercionForRowConstraint(Table table, QualifiedObjectName name, Expression expression, ExpressionAnalysis expressionAnalysis, String constraintType)
+        {
             Type actualType = expressionAnalysis.getType(expression);
             if (!actualType.equals(BOOLEAN)) {
                 TypeCoercion coercion = new TypeCoercion(plannerContext.getTypeManager()::getType);
 
                 if (!coercion.canCoerce(actualType, BOOLEAN)) {
-                    throw new TrinoException(TYPE_MISMATCH, extractLocation(table), format("Expected row filter for '%s' to be of type BOOLEAN, but was %s", name, actualType), null);
+                    throw new TrinoException(TYPE_MISMATCH, extractLocation(table), format("Expected %s for '%s' to be of type BOOLEAN, but was %s", constraintType, name, actualType), null);
                 }
 
                 analysis.addCoercion(expression, BOOLEAN, coercion.isTypeOnlyCoercion(actualType, BOOLEAN));
             }
+        }
 
-            analysis.addRowFilter(table, expression);
+        private void verifyNoSubqueryForCheckConstraint(Expression constraint)
+        {
+            new DefaultTraversalVisitor<Void>()
+            {
+                @Override
+                protected Void visitSubqueryExpression(SubqueryExpression node, Void context)
+                {
+                    throw new TrinoException(INVALID_CHECK_CONSTRAINT, "Subquery is unsupported in CHECK constraint: " + constraint, null);
+                }
+            }.process(constraint, null);
         }
 
         private void analyzeColumnMask(String currentIdentity, Table table, QualifiedObjectName tableName, Field field, Scope scope, ViewExpression mask)

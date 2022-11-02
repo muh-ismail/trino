@@ -640,7 +640,8 @@ public class DefaultJdbcMetadata
                 getSchemaTableName(handle),
                 jdbcClient.getColumns(session, handle).stream()
                         .map(JdbcColumnHandle::getColumnSchema)
-                        .collect(toImmutableList()));
+                        .collect(toImmutableList()),
+                ImmutableList.of());
     }
 
     @Override
