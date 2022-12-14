@@ -30,6 +30,7 @@ import io.trino.filesystem.TrinoFileSystem;
 import io.trino.filesystem.TrinoFileSystemFactory;
 import io.trino.hdfs.HdfsContext;
 import io.trino.hdfs.HdfsEnvironment;
+import io.trino.plugin.deltalake.expression.SparkExpressions;
 import io.trino.plugin.deltalake.metastore.DeltaLakeMetastore;
 import io.trino.plugin.deltalake.metastore.NotADeltaLakeTableException;
 import io.trino.plugin.deltalake.procedure.DeltaLakeTableExecuteHandle;
@@ -452,6 +453,9 @@ public class DeltaLakeMetadata
         String location = metastore.getTableLocation(tableHandle.getSchemaTableName(), session);
         Map<String, String> columnComments = getColumnComments(tableHandle.getMetadataEntry());
         Map<String, Boolean> columnsNullability = getColumnsNullability(tableHandle.getMetadataEntry());
+        List<String> checkConstraints = getCheckConstraints(tableHandle.getMetadataEntry()).values().stream()
+                .map(SparkExpressions::toTrinoExpression)
+                .collect(toImmutableList());
         List<ColumnMetadata> columns = getColumns(tableHandle.getMetadataEntry()).stream()
                 .map(column -> getColumnMetadata(column, columnComments.get(column.getName()), columnsNullability.getOrDefault(column.getName(), true)))
                 .collect(toImmutableList());
@@ -467,7 +471,8 @@ public class DeltaLakeMetadata
                 tableHandle.getSchemaTableName(),
                 columns,
                 properties.buildOrThrow(),
-                Optional.ofNullable(tableHandle.getMetadataEntry().getDescription()));
+                Optional.ofNullable(tableHandle.getMetadataEntry().getDescription()),
+                checkConstraints);
     }
 
     @Override
@@ -1280,9 +1285,6 @@ public class DeltaLakeMetadata
         Map<String, String> columnInvariants = getColumnInvariants(table.getMetadataEntry());
         if (!columnInvariants.isEmpty()) {
             throw new TrinoException(NOT_SUPPORTED, "Inserts are not supported for tables with delta invariants");
-        }
-        if (!getCheckConstraints(table.getMetadataEntry()).isEmpty()) {
-            throw new TrinoException(NOT_SUPPORTED, "Writing to tables with CHECK constraints is not supported");
         }
         checkUnsupportedGeneratedColumns(table.getMetadataEntry());
         checkSupportedWriterVersion(session, table.getSchemaTableName());
