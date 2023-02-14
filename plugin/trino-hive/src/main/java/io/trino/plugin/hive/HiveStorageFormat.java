@@ -101,7 +101,12 @@ public enum HiveStorageFormat
             OpenCSVSerde.class.getName(),
             TextInputFormat.class.getName(),
             HiveIgnoreKeyTextOutputFormat.class.getName(),
-            DataSize.of(8, Unit.MEGABYTE));
+            DataSize.of(8, Unit.MEGABYTE)),
+    JDBC(
+            "org.apache.hive.storage.jdbc.JdbcSerDe",
+            "org.apache.hive.storage.jdbc.JdbcInputFormat",
+            "org.apache.hive.storage.jdbc.JdbcOutputFormat",
+            DataSize.of(64, Unit.MEGABYTE));
 
     private final String serde;
     private final String inputFormat;
